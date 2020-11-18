@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::io::{AsRawFd, FromRawFd},
     path::Path,
     process::{Command, Stdio},
@@ -11,6 +11,8 @@ use std::{error::Error, time::Duration};
 use std::{fs::File, io::ErrorKind};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use ropey::Rope;
 use serde::Deserialize;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::*;
@@ -55,8 +57,10 @@ impl Runner {
         libc::fcntl(fd, libc::F_SETFL, flags);
     }
 
-    fn run(&self, path: &str) -> io::Result<Vec<RawEntry>> {
+    fn run(&self, path: &str, input: ropey::Rope) -> io::Result<Vec<RawEntry>> {
         // TODO? stream results with channel?
+        // TODO just use 2 threads to read stdin/stdout
+        // TODO use unix named pipe, instead of stderr for data
 
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
@@ -85,12 +89,27 @@ impl Runner {
         command
             .env("NWN_FILE_PATH", path)
             .args(&self.args)
+            .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .stdout(unsafe { Stdio::from_raw_fd(slave) });
 
         let mut child = command.spawn()?;
         // close the stdout/stderr writing fds, so OEF can be returned.
         drop(command);
+
+        let mut stdin = child.stdin.take().unwrap();
+
+        std::thread::spawn(move || {
+            for chunk in input.chunks() {
+                match stdin.write_all(chunk.as_bytes()) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!("stdin write err: {}", e);
+                        return;
+                    }
+                }
+            }
+        });
 
         let stderr = child.stderr.take().unwrap();
         let mut stdout = unsafe { os_pipe::PipeReader::from_raw_fd(master) };
@@ -169,6 +188,8 @@ struct LanguageConfig {
     extension: String,
     runner: Runner,
     line_comment: String,
+    #[serde(default)]
+    on_change: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +226,7 @@ struct BackendData {
     data: ArcSwap<RunData>,
     runner: Option<Runner>,
     config: ArcSwap<Config>,
+    buffers: DashMap<Url, ropey::Rope>,
 }
 
 impl Backend {
@@ -214,6 +236,7 @@ impl Backend {
             data: ArcSwap::default(),
             runner: None,
             config: ArcSwap::new(Arc::new(Config::default())),
+            buffers: DashMap::new(),
         }))
     }
 
@@ -254,7 +277,7 @@ impl Backend {
         config
     }
 
-    pub async fn handle_save(&self, uri: &Url, contents: Option<&str>) {
+    pub async fn handle_save(&self, uri: &Url, contents: Option<Rope>) {
         log::info!("handle save");
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
@@ -265,7 +288,7 @@ impl Backend {
 
             // update comments
             if let Some(contents) = contents {
-                self.update_comments(uri, contents).await
+                self.update_comments(uri, &contents).await
             } else {
                 log::warn!("no text in handle_save");
             }
@@ -275,8 +298,14 @@ impl Backend {
     pub fn reload_data(&self, config: Arc<LanguageConfig>, uri: &Url) -> JoinHandle<()> {
         let data = self.0.clone();
         let path = uri.path().to_owned();
+        let buffer = self
+            .0
+            .buffers
+            .get(uri)
+            .map(|buffer| ropey::Rope::clone(&*buffer))
+            .unwrap_or_default();
         std::thread::spawn(move || {
-            let raw_data = match config.runner.run(&path) {
+            let raw_data = match config.runner.run(&path, buffer) {
                 Ok(data) => data,
                 Err(err) => {
                     log::warn!("could not reload data, {}", err);
@@ -299,16 +328,20 @@ impl Backend {
         })
     }
 
-    async fn update_comments(&self, uri: &Url, contents: &str) {
+    async fn update_comments(&self, uri: &Url, contents: &Rope) {
         /// find lines with comment output, result is an exclusive range
-        fn find_prev_output(lines: &[&str], line: usize) -> Option<(usize, usize)> {
+        fn find_prev_output(buffer: &Rope, line: usize) -> Option<(usize, usize)> {
             let mut curr = line + 1;
-            // log::error!("find_prev {}: {:?}", curr, lines[curr]);
-            while curr < lines.len() && lines[curr].trim_start().starts_with("//>") {
+            while curr < buffer.len_lines()
+                && buffer
+                    .line(curr)
+                    .chars()
+                    .skip_while(|c| c.is_whitespace())
+                    .zip("//>".chars())
+                    .all(|(x, y)| x == y)
+            {
                 curr += 1;
             }
-
-            log::error!("found: {}", curr);
 
             if line + 1 == curr {
                 None
@@ -320,13 +353,12 @@ impl Backend {
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             let data = self.0.data.load();
-            let contents_by_line: Vec<&str> = contents.split('\n').collect();
             let changes = data
                 .entries
                 .iter()
                 .filter(|(frame, _)| frame.file == uri.path())
                 .map(|(frame, msgs)| {
-                    let range = find_prev_output(&contents_by_line, frame.line as usize - 1)
+                    let range = find_prev_output(contents, frame.line as usize - 1)
                         .map(|(start_line, end_line)| {
                             Range::new(
                                 Position::new(start_line as u64, 0),
@@ -370,9 +402,8 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(true),
-                        })),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        change: Some(TextDocumentSyncKind::Full),
                         ..Default::default()
                     },
                 )),
@@ -393,13 +424,47 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.handle_save(&params.text_document.uri, Some(&params.text_document.text))
+        let buffer: Rope = params.text_document.text.as_str().into();
+        self.0
+            .buffers
+            .insert(params.text_document.uri.clone(), buffer.clone());
+
+        self.handle_save(&params.text_document.uri, Some(buffer))
             .await
     }
 
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.0.buffers.remove(&params.text_document.uri);
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let buffer: Rope = params.content_changes[0].text.as_str().into();
+        self.0
+            .buffers
+            .insert(params.text_document.uri.clone(), buffer.clone());
+        log::info!(
+            "new buffer: {:?}",
+            self.0
+                .buffers
+                .get(&params.text_document.uri)
+                .map(|rope| rope.len_bytes())
+        );
+
+        let config = self.language_config_for_uri(&params.text_document.uri);
+        if config.map(|config| config.on_change).unwrap_or_default() {
+            self.handle_save(&params.text_document.uri, Some(buffer))
+                .await
+        }
+    }
+
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.handle_save(&params.text_document.uri, params.text.as_deref())
-            .await
+        let buffer = self
+            .0
+            .buffers
+            .get(&params.text_document.uri)
+            .as_deref()
+            .cloned();
+        self.handle_save(&params.text_document.uri, buffer).await
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
