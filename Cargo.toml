@@ -1,0 +1,18 @@
+[package]
+name = "lsp"
+version = "0.1.0"
+authors = ["Robin van Dijk <robin@robinjint.nl>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tower-lsp = "0.13.3"
+tokio = { version = "0.2", features = ["io-std", "io-util", "macros", "net", "test-util"] }
+simple-logging = "2.0.2"
+log = "0.4.11"
+arc-swap = "0.4.7"
+serde_json = "1.0.58"
+serde = { version = "1.0.116", features = ["derive", "rc"] }
+libc = "0.2.80"
+os_pipe = "0.9.2"
