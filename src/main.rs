@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::io::{AsRawFd, FromRawFd},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
     thread::JoinHandle,
@@ -197,6 +197,8 @@ struct LanguageConfig {
 struct Config {
     #[serde(deserialize_with = "Config::map_from_list")]
     languages: HashMap<String, Arc<LanguageConfig>>,
+    #[serde(skip)]
+    base_dir: PathBuf,
 }
 
 impl Config {
@@ -213,9 +215,29 @@ impl Config {
     }
 
     pub fn from_default_config() -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let path = "./.nwn.json";
+        let locations = &["./.nwn.json", "/home/robin.local/.config/nwn/.nwn.json"];
+
+        locations
+            .iter()
+            .filter_map(|path| Self::from_filepath(Path::new(path)).ok())
+            .next()
+            .ok_or_else(|| "no configs found".to_owned().into())
+    }
+
+    pub fn from_filepath(path: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let file = File::open(path).map_err(|e| e.to_string())?;
-        let config = serde_json::from_reader(file).map_err(|e| e.to_string())?;
+        let mut config: Config = serde_json::from_reader(file).map_err(|e| e.to_string())?;
+        config.base_dir = path.parent().unwrap().to_owned();
+        for lang_config in config.languages.values_mut() {
+            log::info!("replacing config values {:?}", lang_config);
+            let runner = &mut Arc::get_mut(lang_config).unwrap().runner;
+            let config_dir = config.base_dir.to_str().unwrap();
+            runner.command = runner.command.replace("{runtimes}", config_dir);
+            for arg in &mut runner.args {
+                *arg = arg.replace("{runtimes}", config_dir);
+            }
+            log::info!("new config values {:?}", lang_config);
+        }
         Ok(config)
     }
 }
@@ -377,7 +399,7 @@ impl Backend {
                         text
                     } else {
                         msgs.iter()
-                        .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
+                            .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
                             .collect()
                     };
                     TextEdit::new(range, text)

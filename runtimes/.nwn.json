@@ -1,0 +1,11 @@
+[{
+    "extension": "js",
+    "on_change": true,
+    "runner": {
+        "command": "node",
+        "args": [
+            "{runtimes}/inject.js"
+        ]
+    },
+    "line_comment": "//"
+}]
