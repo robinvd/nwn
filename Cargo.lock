@@ -279,23 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lsp"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "dashmap",
- "libc",
- "log",
- "os_pipe",
- "ropey",
- "serde",
- "serde_json",
- "simple-logging",
- "tokio",
- "tower-lsp",
-]
-
-[[package]]
 name = "lsp-types"
 version = "0.81.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +375,23 @@ checksum = "05499f3756671c15885fee9034446956fff3f243d6077b91e5767df161f766b3"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "nwn-lsp"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "dashmap",
+ "libc",
+ "log",
+ "os_pipe",
+ "ropey",
+ "serde",
+ "serde_json",
+ "simple-logging",
+ "tokio",
+ "tower-lsp",
 ]
 
 [[package]]

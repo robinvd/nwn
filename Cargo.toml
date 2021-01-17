@@ -1,5 +1,5 @@
 [package]
-name = "lsp"
+name = "nwn-lsp"
 version = "0.1.0"
 authors = ["Robin van Dijk <robin@robinjint.nl>"]
 edition = "2018"
