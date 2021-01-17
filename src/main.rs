@@ -163,7 +163,7 @@ impl Runner {
             }
 
             if would_block {
-                std::thread::sleep(Duration::from_millis(100))
+                std::thread::sleep(Duration::from_millis(1))
             }
         }
 
@@ -336,7 +336,7 @@ impl Backend {
                 && buffer
                     .line(curr)
                     .chars()
-                    .skip_while(|c| c.is_whitespace())
+                    .skip_while(|c| [' ', '\t'].contains(c))
                     .zip("//>".chars())
                     .all(|(x, y)| x == y)
             {
@@ -369,10 +369,17 @@ impl Backend {
                             Range::new(Position::new(frame.line, 0), Position::new(frame.line, 0))
                         });
 
-                    let text = msgs
-                        .iter()
+                    let single_line = false;
+                    let text = if single_line {
+                        let mut text = format!("{}> ", config.line_comment);
+                        text.extend(msgs.iter().map(|msg| format!("{:?} | ", msg)));
+                        text.push('\n');
+                        text
+                    } else {
+                        msgs.iter()
                         .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
-                        .collect();
+                            .collect()
+                    };
                     TextEdit::new(range, text)
                 })
                 .collect();
