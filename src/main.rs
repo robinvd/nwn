@@ -1,22 +1,27 @@
 use std::{
     collections::HashMap,
-    io::{self, BufRead, BufReader, Read, Write},
-    os::unix::io::{AsRawFd, FromRawFd},
+    error::Error,
+    fs::File,
+    io::{self, BufRead, BufReader, ErrorKind, Read, Write},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
-    thread::JoinHandle,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use std::{error::Error, time::Duration};
-use std::{fs::File, io::ErrorKind};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use futures::{future, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ropey::Rope;
 use serde::Deserialize;
-use tower_lsp::jsonrpc::Result as RpcResult;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    net::UnixListener,
+};
+use tower_lsp::{
+    jsonrpc::Result as RpcResult, lsp_types::*, Client, LanguageServer, LspService, Server,
+};
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Hash)]
 struct Frame {
@@ -57,121 +62,101 @@ impl Runner {
         libc::fcntl(fd, libc::F_SETFL, flags);
     }
 
-    fn run(&self, path: &str, input: ropey::Rope) -> io::Result<Vec<RawEntry>> {
-        // TODO? stream results with channel?
-        // TODO just use 2 threads to read stdin/stdout
-        // TODO use unix named pipe, instead of stderr for data
+    async fn run_collect(&self, path: &str, input: ropey::Rope) -> io::Result<Vec<RawEntry>> {
+        self.run(path, input).await?.try_collect().await
+    }
 
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        let winsize = libc::winsize {
-            ws_col: 80,
-            ws_row: 24,
-            ws_xpixel: 480,
-            ws_ypixel: 192,
-        };
-        let result = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &winsize,
-            )
-        };
+    async fn run(
+        &self,
+        path: &str,
+        input: ropey::Rope,
+    ) -> io::Result<impl Stream<Item = io::Result<RawEntry>>> {
+        log::info!("run2");
 
-        if result == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut dir = std::env::temp_dir();
+        dir.push(&format!(
+            "nwn_conn{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
 
-        let mut command = Command::new(&self.command);
+        log::info!("path {:?}", dir);
+        let mut listener = UnixListener::bind(&dir)?;
 
-        command
+        log::info!("opened");
+        let mut command = tokio::process::Command::new(&self.command);
+        let mut handle = command
             .env("NWN_FILE_PATH", path)
+            .env("NWN_CONNECTION_FD", &dir)
             .args(&self.args)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stderr(Stdio::piped())
-            .stdout(unsafe { Stdio::from_raw_fd(slave) });
+            .stdout(Stdio::piped())
+            .spawn()?;
 
-        let mut child = command.spawn()?;
-        // close the stdout/stderr writing fds, so OEF can be returned.
-        drop(command);
+        log::info!("spawned");
 
-        let mut stdin = child.stdin.take().unwrap();
+        let stdout = handle.stdout.take().unwrap();
+        let stderr = handle.stderr.take().unwrap();
 
-        std::thread::spawn(move || {
-            for chunk in input.chunks() {
-                match stdin.write_all(chunk.as_bytes()) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        log::error!("stdin write err: {}", e);
-                        return;
-                    }
-                }
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr).lines();
+
+            while let Some(line) = reader.next().await {
+                log::error!("inject msg: {:?}", line);
+            }
+        });
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+
+            while let Some(line) = reader.next().await {
+                log::warn!("inject msg: {:?}", line);
             }
         });
 
-        let stderr = child.stderr.take().unwrap();
-        let mut stdout = unsafe { os_pipe::PipeReader::from_raw_fd(master) };
-        unsafe {
-            Self::set_nonblocking(&stderr);
-            Self::set_nonblocking(&stdout);
-        }
-        let mut stderr = BufReader::new(stderr);
+        tokio::spawn(async move {
+            handle
+                .await
+                .map_err(|err| log::error!("err: {:?}", err))
+                .ok();
 
-        let mut buffer = [0; 1024];
-        let mut string_buffer = String::new();
-        let mut entries = Vec::new();
-        let (mut stdout_done, mut stderr_done) = (false, false);
-        let mut would_block = false;
+            log::info!("child finished")
+        });
 
-        while !(stdout_done && stderr_done) {
-            if !stderr_done {
-                string_buffer.clear();
-                match stderr.read_line(&mut string_buffer) {
-                    Ok(0) => {
-                        stderr_done = true;
-                    }
-                    Ok(_) => {
-                        log::warn!("read line: {:?}", string_buffer);
-                        if string_buffer.trim().is_empty() {
-                            continue;
-                        }
-                        let entry = RawEntry::from_json(string_buffer.as_bytes());
-                        match entry {
-                            Ok(entry) => entries.push(entry),
-                            Err(err) => {
-                                log::error!("reading line json err: {:?}", err);
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => would_block = true,
-                    Err(e) => return Err(e),
+        let (right, _) = listener.accept().await?;
+        let (read, mut write) = tokio::io::split(right);
+
+        tokio::spawn(async move {
+            for part in input.chunks() {
+                let result = write.write_all(part.as_bytes()).await;
+                if result.is_err() {
+                    break;
                 }
             }
 
-            if !stdout_done {
-                log::info!("start read stdout");
-                match stdout.read(&mut buffer) {
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => would_block = true,
-                    Ok(0) | Err(_) => {
-                        stdout_done = true;
+            write.write_all(&[0]).await.ok();
+
+            log::info!("finished contents write");
+        });
+
+        log::info!("start loop");
+
+        Ok(tokio::io::BufReader::new(read)
+            .lines()
+            .inspect(|line| log::info!("line: {:?}", line))
+            .try_filter(|line| future::ready(!line.trim().is_empty()))
+            .try_filter_map(|line| async move {
+                let entry = RawEntry::from_json(line.as_bytes());
+                match entry {
+                    Ok(entry) => Ok(Some(entry)),
+                    Err(err) => {
+                        log::error!("reading line json err: {:?}", err);
+                        Ok(None)
                     }
-                    Ok(_) => {}
                 }
-                log::info!("finish read stdout");
-            }
-
-            if would_block {
-                std::thread::sleep(Duration::from_millis(1))
-            }
-        }
-
-        log::info!("finished reading");
-
-        child.wait()?;
-
-        Ok(entries)
+            }))
     }
 }
 
@@ -303,10 +288,7 @@ impl Backend {
         log::info!("handle save");
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
-            if let Err(e) = self.reload_data(config, uri).join() {
-                log::error!("did open reload err {:?}", e);
-                return;
-            }
+            self.reload_data(config, uri).await;
 
             // update comments
             if let Some(contents) = contents {
@@ -317,7 +299,8 @@ impl Backend {
         }
     }
 
-    pub fn reload_data(&self, config: Arc<LanguageConfig>, uri: &Url) -> JoinHandle<()> {
+    pub async fn reload_data(&self, config: Arc<LanguageConfig>, uri: &Url) {
+        log::info!("start reload");
         let data = self.0.clone();
         let path = uri.path().to_owned();
         let buffer = self
@@ -326,28 +309,28 @@ impl Backend {
             .get(uri)
             .map(|buffer| ropey::Rope::clone(&*buffer))
             .unwrap_or_default();
-        std::thread::spawn(move || {
-            let raw_data = match config.runner.run(&path, buffer) {
-                Ok(data) => data,
-                Err(err) => {
-                    log::warn!("could not reload data, {}", err);
-                    return;
-                }
-            };
 
-            let mut new_data = HashMap::new();
-            for entry in raw_data {
-                let text = Arc::new(entry.out);
-                for frame in entry.frames {
-                    let list = new_data.entry(frame).or_insert_with(Vec::default);
-                    list.push(text.clone());
-                }
+        let res = config.runner.run_collect(&path, buffer).await;
+        log::warn!("reload res: {:?}", res);
+        let raw_data = match res {
+            Ok(data) => data,
+            Err(err) => {
+                log::warn!("could not reload data, {}", err);
+                return;
             }
+        };
+        let mut new_data = HashMap::new();
+        for entry in raw_data {
+            let text = Arc::new(entry.out);
+            for frame in entry.frames {
+                let list = new_data.entry(frame).or_insert_with(Vec::default);
+                list.push(text.clone());
+            }
+        }
 
-            log::info!("new: {:?}", new_data);
+        log::info!("new: {:?}", new_data);
 
-            data.data.store(Arc::new(RunData { entries: new_data }));
-        })
+        data.data.store(Arc::new(RunData { entries: new_data }));
     }
 
     async fn update_comments(&self, uri: &Url, contents: &Rope) {

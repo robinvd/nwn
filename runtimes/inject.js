@@ -1,8 +1,11 @@
-const fs = require('fs')
-
+const net = require('net')
 const log = console.log;
 
-console.log = (...args) => {
+log("test")
+const connectionPath = process.env.NWN_CONNECTION_FD;
+const realFile = process.env.NWN_FILE_PATH
+
+function getStackTrace() {
     const stack = new Error().stack;
     const stackData = stack
         .split('\n')
@@ -10,13 +13,9 @@ console.log = (...args) => {
         .map((line) => /\(([^:]+):(\d+):\d+\)/.exec(line))
         .filter((match) => match !== null)
         .map((match) => { return { file: match[1], line: Number(match[2]) } })
-    const data = {
-        frames: stackData,
-        out: args.join(" "),
-    }
-    process.stderr.write(JSON.stringify(data) + '\n');
 
-    log(...args);
+    return stackData;
+    return data
 }
 
 function requireFromString(src, filename) {
@@ -26,12 +25,43 @@ function requireFromString(src, filename) {
     return m.exports;
 }
 
-const realFile = process.env.NWN_FILE_PATH
+function handleMessage(data) {
+    log('handle msg');
+    requireFromString(data, realFile)
+}
 
-fs.readFile(process.stdin.fd, (err, text) => {
-    if (!err) {
-        requireFromString(String(text), realFile)
-    } else {
-        log("error loading file:", err)
+const client = net.createConnection(connectionPath);
+
+console.log = (...args) => {
+    log("console log started");
+    const stackData = getStackTrace();
+    const data = {
+        frames: stackData,
+        out: args.join(" "),
     }
+    const output_data = JSON.stringify(data) + '\n';
+    log('output data', output_data);
+    // process.stderr.write(JSON.stringify(data) + '\n');
+    // log(...args);
+    client.write(output_data)
+}
+
+let contents = "";
+
+client.on('data', (data) => {
+    contents += data;
+
+    log(JSON.stringify(contents));
+    log(contents[contents.length - 1], contents[contents.length - 1] === '\u{0}');
+    log(typeof(contents))
+
+    if (contents[contents.length - 1] === '\u{0}') {
+        contents = contents.slice(0, -1);
+        handleMessage(contents)
+        client.end()
+    }
+})
+
+client.on('end', () => {
+    log("end!")
 })
