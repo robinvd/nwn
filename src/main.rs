@@ -531,6 +531,7 @@ impl LanguageServer for Backend {
 #[tokio::main]
 async fn main() {
     simple_logging::log_to_file("test.log", log::LevelFilter::Info).unwrap();
+    log_panics::init();
     log::info!("start");
 
     let stdin = tokio::io::stdin();
