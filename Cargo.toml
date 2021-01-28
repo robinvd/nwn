@@ -8,7 +8,8 @@ edition = "2018"
 
 [dependencies]
 tower-lsp = "0.13.3"
-tokio = { version = "0.2", features = ["io-std", "io-util", "macros", "net", "test-util"] }
+tokio = { version = "0.2", features = ["io-std", "io-util", "macros", "net", "test-util", "process"] }
+futures = "0.3"
 simple-logging = "2.0.2"
 log = "0.4.11"
 arc-swap = "0.4.7"

@@ -352,14 +352,19 @@ impl Backend {
 
     async fn update_comments(&self, uri: &Url, contents: &Rope) {
         /// find lines with comment output, result is an exclusive range
-        fn find_prev_output(buffer: &Rope, line: usize) -> Option<(usize, usize)> {
+        fn find_prev_output(
+            buffer: &Rope,
+            comment_str: &str,
+            line: usize,
+        ) -> Option<(usize, usize)> {
+            let comment_start = format!("{}>", comment_str);
             let mut curr = line + 1;
             while curr < buffer.len_lines()
                 && buffer
                     .line(curr)
                     .chars()
                     .skip_while(|c| [' ', '\t'].contains(c))
-                    .zip("//>".chars())
+                    .zip(comment_start.chars())
                     .all(|(x, y)| x == y)
             {
                 curr += 1;
@@ -379,8 +384,10 @@ impl Backend {
                 .entries
                 .iter()
                 .filter(|(frame, _)| frame.file == uri.path())
-                .map(|(frame, msgs)| {
-                    let range = find_prev_output(contents, frame.line as usize - 1)
+                .filter_map(|(frame, msgs)| {
+                    let offset_range =
+                        find_prev_output(contents, &config.line_comment, frame.line as usize - 1);
+                    let range = offset_range
                         .map(|(start_line, end_line)| {
                             Range::new(
                                 Position::new(start_line as u64, 0),
@@ -402,7 +409,17 @@ impl Backend {
                             .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
                             .collect()
                     };
-                    TextEdit::new(range, text)
+                    if contents
+                        .lines_at(range.start.line as usize)
+                        .take(range.end.line as usize - range.start.line as usize)
+                        .map(|slice| slice.chars())
+                        .flatten()
+                        .eq(text.chars())
+                    {
+                        return None;
+                    }
+
+                    Some(TextEdit::new(range, text))
                 })
                 .collect();
 
