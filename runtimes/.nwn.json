@@ -1,11 +1,23 @@
 [{
-    "extension": "js",
-    "on_change": true,
-    "runner": {
-        "command": "node",
-        "args": [
-            "{runtimes}/inject.js"
-        ]
+        "extension": "js",
+        "on_change": true,
+        "runner": {
+            "command": "node",
+            "args": [
+                "{runtimes}/inject.js"
+            ]
+        },
+        "line_comment": "//"
     },
-    "line_comment": "//"
-}]
+    {
+        "extension": "py",
+        "on_change": true,
+        "runner": {
+            "command": "python",
+            "args": [
+                "{runtimes}/inject.py"
+            ]
+        },
+        "line_comment": "#"
+    }
+]
