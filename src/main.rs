@@ -2,17 +2,16 @@ use std::{
     collections::HashMap,
     error::Error,
     fs::File,
-    io::{self, BufRead, BufReader, ErrorKind, Read, Write},
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::{future, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, Stream, StreamExt, TryStreamExt};
 use ropey::Rope;
 use serde::Deserialize;
 use tokio::{
@@ -55,13 +54,6 @@ struct Runner {
 }
 
 impl Runner {
-    unsafe fn set_nonblocking(fd: &impl AsRawFd) {
-        let fd = fd.as_raw_fd();
-        let mut flags = libc::fcntl(fd, libc::F_GETFL);
-        flags |= libc::O_NONBLOCK;
-        libc::fcntl(fd, libc::F_SETFL, flags);
-    }
-
     async fn run_collect(&self, path: &str, input: ropey::Rope) -> io::Result<Vec<RawEntry>> {
         self.run(path, input).await?.try_collect().await
     }
