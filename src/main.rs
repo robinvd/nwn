@@ -12,6 +12,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::{future, Stream, StreamExt, TryStreamExt};
+use regex::Regex;
 use ropey::Rope;
 use serde::Deserialize;
 use tokio::{
@@ -32,6 +33,7 @@ struct Frame {
 struct RawEntry {
     frames: Vec<Frame>,
     out: String,
+    insert: Option<String>,
 }
 
 impl RawEntry {
@@ -154,7 +156,31 @@ impl Runner {
 
 #[derive(Debug, Default)]
 struct RunData {
-    entries: HashMap<Frame, Vec<Arc<String>>>,
+    entries: HashMap<Frame, RunEntry>,
+}
+
+#[derive(Debug)]
+struct RunEntry {
+    insert_type: Option<String>,
+    out: Vec<Arc<String>>,
+}
+
+impl RunData {
+    pub fn from_raw(raws: Vec<RawEntry>) -> Self {
+        let mut new_data = HashMap::new();
+        for entry in raws {
+            let text = Arc::new(entry.out);
+            for frame in entry.frames {
+                let run_entry = new_data.entry(frame).or_insert(RunEntry {
+                    out: Vec::new(),
+                    insert_type: entry.insert.clone(),
+                });
+                run_entry.out.push(text.clone());
+            }
+        }
+
+        RunData { entries: new_data }
+    }
 }
 
 #[derive(Debug)]
@@ -167,6 +193,17 @@ struct LanguageConfig {
     line_comment: String,
     #[serde(default)]
     on_change: bool,
+
+    #[serde(default)]
+    places: Vec<Place>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Place {
+    name: String,
+    #[serde(with = "serde_regex")]
+    regex: Regex,
+    insert_place: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -196,7 +233,11 @@ impl Config {
 
         locations
             .iter()
-            .filter_map(|path| Self::from_filepath(Path::new(path)).ok())
+            .filter_map(|path| {
+                Self::from_filepath(Path::new(path))
+                    .map_err(|err| log::warn!("config load err: {}", err))
+                    .ok()
+            })
             .next()
             .ok_or_else(|| "no configs found".to_owned().into())
     }
@@ -311,18 +352,9 @@ impl Backend {
                 return;
             }
         };
-        let mut new_data = HashMap::new();
-        for entry in raw_data {
-            let text = Arc::new(entry.out);
-            for frame in entry.frames {
-                let list = new_data.entry(frame).or_insert_with(Vec::default);
-                list.push(text.clone());
-            }
-        }
-
+        let new_data = RunData::from_raw(raw_data);
         log::info!("new: {:?}", new_data);
-
-        data.data.store(Arc::new(RunData { entries: new_data }));
+        data.data.store(Arc::new(new_data));
     }
 
     async fn update_comments(&self, uri: &Url, contents: &Rope) {
@@ -352,6 +384,78 @@ impl Backend {
             }
         }
 
+        fn make_output_comment(
+            contents: &Rope,
+            config: &LanguageConfig,
+            frame: &Frame,
+            entry: &RunEntry,
+        ) -> Option<TextEdit> {
+            let offset_range =
+                find_prev_output(contents, &config.line_comment, frame.line as usize - 1);
+            let range = offset_range
+                .map(|(start_line, end_line)| {
+                    Range::new(
+                        Position::new(start_line as u64, 0),
+                        Position::new(end_line as u64, 0),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    Range::new(Position::new(frame.line, 0), Position::new(frame.line, 0))
+                });
+
+            let single_line = false;
+            let text = if single_line {
+                let mut text = format!("{}> ", config.line_comment);
+                text.extend(entry.out.iter().map(|msg| format!("{:?} | ", msg)));
+                text.push('\n');
+                text
+            } else {
+                entry
+                    .out
+                    .iter()
+                    .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
+                    .collect()
+            };
+            if contents
+                .lines_at(range.start.line as usize)
+                .take(range.end.line as usize - range.start.line as usize)
+                .map(|slice| slice.chars())
+                .flatten()
+                .eq(text.chars())
+            {
+                return None;
+            }
+
+            Some(TextEdit::new(range, text))
+        }
+
+        fn make_insert(
+            contents: &Rope,
+            config: &LanguageConfig,
+            frame: &Frame,
+            entry: &RunEntry,
+        ) -> Option<TextEdit> {
+            let insert_type = entry.insert_type.as_ref().unwrap();
+            let line_text = contents.line(frame.line as usize - 1).to_string();
+
+            config
+                .places
+                .iter()
+                .filter(|place| &place.name == insert_type)
+                .filter_map(|place| {
+                    log::info!("trying: {:?}", place.regex);
+                    let captures = place.regex.captures(&line_text)?;
+                    let match_ = captures.get(place.insert_place)?;
+                    log::info!("regex match: {:?}", match_);
+                    let range = Range::new(
+                        Position::new(frame.line - 1, match_.start() as u64),
+                        Position::new(frame.line - 1, match_.end() as u64),
+                    );
+                    Some(TextEdit::new(range, entry.out.first()?.to_string()))
+                })
+                .next()
+        }
+
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             let data = self.0.data.load();
@@ -359,42 +463,12 @@ impl Backend {
                 .entries
                 .iter()
                 .filter(|(frame, _)| frame.file == uri.path())
-                .filter_map(|(frame, msgs)| {
-                    let offset_range =
-                        find_prev_output(contents, &config.line_comment, frame.line as usize - 1);
-                    let range = offset_range
-                        .map(|(start_line, end_line)| {
-                            Range::new(
-                                Position::new(start_line as u64, 0),
-                                Position::new(end_line as u64, 0),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            Range::new(Position::new(frame.line, 0), Position::new(frame.line, 0))
-                        });
-
-                    let single_line = false;
-                    let text = if single_line {
-                        let mut text = format!("{}> ", config.line_comment);
-                        text.extend(msgs.iter().map(|msg| format!("{:?} | ", msg)));
-                        text.push('\n');
-                        text
+                .filter_map(|(frame, entry)| {
+                    if entry.insert_type.is_some() {
+                        make_insert(contents, &config, frame, &entry)
                     } else {
-                        msgs.iter()
-                            .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
-                            .collect()
-                    };
-                    if contents
-                        .lines_at(range.start.line as usize)
-                        .take(range.end.line as usize - range.start.line as usize)
-                        .map(|slice| slice.chars())
-                        .flatten()
-                        .eq(text.chars())
-                    {
-                        return None;
+                        make_output_comment(contents, &config, frame, &entry)
                     }
-
-                    Some(TextEdit::new(range, text))
                 })
                 .collect();
 
@@ -508,7 +582,7 @@ impl LanguageServer for Backend {
 
         Ok(self.0.data.load().entries.get(&frame).map(|data| {
             let mut msg = String::new();
-            for s in data {
+            for s in &data.out {
                 msg.push_str(s)
             }
             log::info!("hover msg {:?}", msg);
