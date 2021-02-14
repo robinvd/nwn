@@ -1,4 +1,5 @@
-[{
+[
+    {
         "extension": "js",
         "on_change": true,
         "runner": {
@@ -18,6 +19,18 @@
                 "{runtimes}/inject.py"
             ]
         },
-        "line_comment": "#"
+        "line_comment": "#",
+        "places": [
+            {
+                "name": "last_arg",
+                "regex": "do\\(.*, *(.*)\\)",
+                "insert_place": 1
+            },
+            {
+                "name": "args",
+                "regex": "\\((.*)\\)",
+                "insert_place": 1
+            }
+        ]
     }
 ]
