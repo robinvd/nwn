@@ -32,8 +32,10 @@ struct Frame {
 #[derive(Debug, Deserialize)]
 struct RawEntry {
     frames: Vec<Frame>,
+    #[serde(default)]
     out: String,
     insert: Option<String>,
+    changes: Option<Vec<TextEdit>>,
 }
 
 impl RawEntry {
@@ -157,6 +159,7 @@ impl Runner {
 #[derive(Debug, Default)]
 struct RunData {
     entries: HashMap<Frame, RunEntry>,
+    changes: Vec<TextEdit>,
 }
 
 #[derive(Debug)]
@@ -168,18 +171,26 @@ struct RunEntry {
 impl RunData {
     pub fn from_raw(raws: Vec<RawEntry>) -> Self {
         let mut new_data = HashMap::new();
+        let mut changes = Vec::new();
         for entry in raws {
-            let text = Arc::new(entry.out);
-            for frame in entry.frames {
-                let run_entry = new_data.entry(frame).or_insert(RunEntry {
-                    out: Vec::new(),
-                    insert_type: entry.insert.clone(),
-                });
-                run_entry.out.push(text.clone());
+            if let Some(new_changes) = entry.changes {
+                changes.extend(new_changes)
+            } else {
+                let text = Arc::new(entry.out);
+                for frame in entry.frames {
+                    let run_entry = new_data.entry(frame).or_insert(RunEntry {
+                        out: Vec::new(),
+                        insert_type: entry.insert.clone(),
+                    });
+                    run_entry.out.push(text.clone());
+                }
             }
         }
 
-        RunData { entries: new_data }
+        RunData {
+            entries: new_data,
+            changes,
+        }
     }
 }
 
@@ -233,12 +244,11 @@ impl Config {
 
         locations
             .iter()
-            .filter_map(|path| {
+            .find_map(|path| {
                 Self::from_filepath(Path::new(path))
                     .map_err(|err| log::warn!("config load err: {}", err))
                     .ok()
             })
-            .next()
             .ok_or_else(|| "no configs found".to_owned().into())
     }
 
@@ -459,7 +469,7 @@ impl Backend {
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             let data = self.0.data.load();
-            let changes = data
+            let mut changes: Vec<TextEdit> = data
                 .entries
                 .iter()
                 .filter(|(frame, _)| frame.file == uri.path())
@@ -471,6 +481,8 @@ impl Backend {
                     }
                 })
                 .collect();
+
+            changes.extend(data.changes.iter().cloned());
 
             log::info!("edits: {:?}", changes);
 
