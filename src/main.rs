@@ -169,7 +169,7 @@ struct RunEntry {
 }
 
 impl RunData {
-    pub fn from_raw(raws: Vec<RawEntry>) -> Self {
+    pub fn from_raw(raws: Vec<RawEntry>, path: &str) -> Self {
         let mut new_data = HashMap::new();
         let mut changes = Vec::new();
         for entry in raws {
@@ -177,12 +177,12 @@ impl RunData {
                 changes.extend(new_changes)
             } else {
                 let text = Arc::new(entry.out);
-                for frame in entry.frames {
+                if let Some(frame) = entry.frames.into_iter().find(|frame| frame.file == path) {
                     let run_entry = new_data.entry(frame).or_insert(RunEntry {
                         out: Vec::new(),
                         insert_type: entry.insert.clone(),
                     });
-                    run_entry.out.push(text.clone());
+                    run_entry.out.push(text.clone())
                 }
             }
         }
