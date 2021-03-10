@@ -362,9 +362,30 @@ impl Backend {
                 return;
             }
         };
-        let new_data = RunData::from_raw(raw_data);
+        let new_data = RunData::from_raw(raw_data, &path);
         log::info!("new: {:?}", new_data);
         data.data.store(Arc::new(new_data));
+    }
+
+    fn starts_with(slice: &RopeSlice, text: &str) -> bool {
+        if slice.len_chars() < text.chars().count() {
+            return false;
+        }
+        slice.chars().zip(text.chars()).all(|(x, y)| x == y)
+    }
+
+    fn find_output_ranges<'a>(
+        &self,
+        uri: &Url,
+        contents: &'a Rope,
+    ) -> impl Iterator<Item = usize> + 'a {
+        // TODO language idenpendant
+        let output_start = "#>";
+        contents
+            .lines()
+            .enumerate()
+            .filter(move |(_, line)| Self::starts_with(line, output_start))
+            .map(|(line, _)| line)
     }
 
     async fn update_comments(&self, uri: &Url, contents: &Rope) {
@@ -510,6 +531,7 @@ impl LanguageServer for Backend {
         log::info!("initialize");
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
@@ -609,6 +631,35 @@ impl LanguageServer for Backend {
             }
         }))
     }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> RpcResult<Option<Vec<FoldingRange>>> {
+        if let Some(buffer) = self.0.buffers.get(&params.text_document.uri) {
+            let mut folds: Vec<FoldingRange> = Vec::new();
+            for line_number in self
+                .find_output_ranges(&params.text_document.uri, &buffer)
+                .map(|n| n as u64)
+            {
+                match folds.last_mut() {
+                    Some(last) if last.end_line + 1 == line_number => {
+                        last.end_line += 1;
+                    }
+                    _ => folds.push(FoldingRange {
+                        start_line: line_number,
+                        end_line: line_number,
+                        kind: Some(FoldingRangeKind::Comment),
+                        ..Default::default()
+                    }),
+                }
+            }
+
+            Ok(Some(folds))
+        } else {
+            Ok(None)
+        }
+}
 }
 
 #[tokio::main]
