@@ -423,7 +423,12 @@ impl Backend {
                 entry
                     .out
                     .iter()
-                    .map(|msg| format!("{}> {:?}\n", config.line_comment, msg))
+                    .map(|msg| msg.lines())
+                    .flatten()
+                    .map(|msg| {
+                        let escaped = format!("{:?}", msg);
+                        format!("{}> {}\n", config.line_comment, escaped.trim_matches('"'))
+                    })
                     .collect()
             };
             if contents
