@@ -1,31 +1,13 @@
-import socket
-import ast
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import itertools
 import json
 import os
-import importlib.util, importlib.machinery, importlib.abc
+import socket
+import sys
 import traceback
-
-
-root_ast = None
-
-
-class ArgFinder(ast.NodeVisitor):
-    def __init__(self, *args, name, lineno, **kwargs):
-        self._name = name
-        self._lineno = lineno
-        self._result = None
-        super().__init__(*args, **kwargs)
-
-    def visit(self, node):
-        super().visit(node)
-        return self._result
-
-    def visit_Call(self, node: ast.Call):
-        if getattr(node.func, "id", None) != self._name or node.lineno != self._lineno:
-            return self.generic_visit(node)
-
-        self._result = node
-        return node
+from typing import Optional
 
 
 class MemoryLoader(importlib.abc.FileLoader):
@@ -43,8 +25,9 @@ class MemoryLoader(importlib.abc.FileLoader):
         return self._code
 
 
-def get_stack_trace():
-    stack_summary = traceback.extract_stack()
+def get_stack_trace(stack_summary: Optional[traceback.StackSummary]=None):
+    if not stack_summary:
+        stack_summary = traceback.extract_stack()
 
     return [{
         "file": frame.filename,
@@ -67,62 +50,13 @@ def show(*args):
     send_msg(data)
 
 
-def do(val, _result=None):
-    stack_data = get_stack_trace()
+def debug(*args):
     data = {
-        "frames": stack_data,
-        "out": str(val),
-        "insert": "last_arg",
+        "frames": get_stack_trace(),
+        "out": " ".join(str(arg) for arg in args),
+        "kind": "debug",
     }
-
     send_msg(data)
-
-    return val
-
-
-def sheet(user_data):
-    stack_data = get_stack_trace()
-    calling_code_line = stack_data[-3]["line"]
-
-    try:
-        call_ast: ast.Call = ArgFinder(name="sheet", lineno=calling_code_line).visit(root_ast)
-        assert isinstance(call_ast, ast.Call)
-        user_data_ast = call_ast.args[0]
-
-        if not isinstance(user_data_ast, ast.List):
-            return
-
-        changes = []
-        for row_ast, row in zip(user_data_ast.elts, user_data):
-            if not isinstance(row_ast, ast.Dict):
-                continue
-
-            for value_ast, (key, value) in zip(row_ast.values, row.items()):
-                if callable(key):
-                    try:
-                        new_value = key(user_data, row)
-                    except Exception as e:
-                        print(e)
-                        continue
-                    changes.append({
-                        "range": {
-                            "start": {"line": value_ast.lineno - 1, "character": value_ast.col_offset},
-                            "end": {"line": value_ast.end_lineno - 1, "character": value_ast.end_col_offset},
-                        },
-                        "newText": str(new_value),
-                    })
-    except Exception as e:
-        print(e)
-        return
-
-    data = {
-        "frames": stack_data,
-        "changes": changes,
-    }
-
-    send_msg(data)
-
-    return None
 
 
 def import_from_string(code: bytes, path: str):
@@ -130,18 +64,21 @@ def import_from_string(code: bytes, path: str):
     loader = MemoryLoader(path, code)
     spec = importlib.machinery.ModuleSpec(module_name, loader)
     module = importlib.util.module_from_spec(spec)
-    global root_ast
-    root_ast = ast.parse(code)
-
     module.show = show
-    module.do = do
-    module.sheet = sheet
+    module.debug = debug
 
-    module.__loader__.exec_module(module)
-
-
-def handle_message(data: bytes, path: str):
-    import_from_string(data, path)
+    try:
+        module.__loader__.exec_module(module)
+    except Exception:
+        out = traceback.format_exc().splitlines()
+        exc_msg = out.pop()
+        out = "\n".join(itertools.chain([exc_msg], out))
+        data = {
+            "frames": get_stack_trace(stack_summary=traceback.extract_tb(sys.exc_info()[2])),
+            "out": out,
+            "kind": "error",
+        }
+        send_msg(data)
 
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -161,5 +98,5 @@ while True:
 
     all_data.extend(data)
     if len(all_data) > 0 and all_data[-1] == 0:
-        handle_message(all_data[:-1], backing_file_path)
+        import_from_string(all_data[:-1], backing_file_path)
         break

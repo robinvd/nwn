@@ -1,7 +1,6 @@
 const net = require('net')
 const log = console.log;
 
-log("test")
 const connectionPath = process.env.NWN_CONNECTION_FD;
 const realFile = process.env.NWN_FILE_PATH
 
@@ -15,7 +14,6 @@ function getStackTrace() {
         .map((match) => { return { file: match[1], line: Number(match[2]) } })
 
     return stackData;
-    return data
 }
 
 function requireFromString(src, filename) {
@@ -40,9 +38,6 @@ console.log = (...args) => {
         out: args.join(" "),
     }
     const output_data = JSON.stringify(data) + '\n';
-    log('output data', output_data);
-    // process.stderr.write(JSON.stringify(data) + '\n');
-    // log(...args);
     client.write(output_data)
 }
 
@@ -50,10 +45,6 @@ let contents = "";
 
 client.on('data', (data) => {
     contents += data;
-
-    log(JSON.stringify(contents));
-    log(contents[contents.length - 1], contents[contents.length - 1] === '\u{0}');
-    log(typeof(contents))
 
     if (contents[contents.length - 1] === '\u{0}') {
         contents = contents.slice(0, -1);

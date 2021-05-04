@@ -13,8 +13,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::{future, Stream, StreamExt, TryStreamExt};
 use regex::Regex;
-use ropey::Rope;
-use serde::Deserialize;
+use ropey::{Rope, RopeSlice};
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     net::UnixListener,
@@ -23,19 +23,39 @@ use tower_lsp::{
     jsonrpc::Result as RpcResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
 
-#[derive(Debug, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 struct Frame {
     file: String,
     line: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawEntry {
     frames: Vec<Frame>,
-    #[serde(default)]
-    out: String,
-    insert: Option<String>,
-    changes: Option<Vec<TextEdit>>,
+    #[serde(flatten)]
+    inner: RawEntryInner,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RawEntryInner {
+    Simple {
+        out: String,
+        // insert: Option<String>,
+        kind: Option<RawEntryKind>,
+    },
+    Edits {
+        changes: Vec<TextEdit>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RawEntryKind {
+    Output,
+    Debug,
+    Error,
+    Regex,
 }
 
 impl RawEntry {
@@ -144,6 +164,7 @@ impl Runner {
             .inspect(|line| log::info!("line: {:?}", line))
             .try_filter(|line| future::ready(!line.trim().is_empty()))
             .try_filter_map(|line| async move {
+                log::info!("got line: {:?}", line);
                 let entry = RawEntry::from_json(line.as_bytes());
                 match entry {
                     Ok(entry) => Ok(Some(entry)),
@@ -159,6 +180,7 @@ impl Runner {
 #[derive(Debug, Default)]
 struct RunData {
     entries: HashMap<Frame, RunEntry>,
+    hovers: HashMap<Frame, RunEntry>,
     changes: Vec<TextEdit>,
 }
 
@@ -169,26 +191,74 @@ struct RunEntry {
 }
 
 impl RunData {
-    pub fn from_raw(raws: Vec<RawEntry>, path: &str) -> Self {
-        let mut new_data = HashMap::new();
+    pub async fn from_raw(mut raws: impl Stream<Item = RawEntry> + Unpin, path: &str) -> Self {
+        let mut new_entries = HashMap::new();
+        let mut new_hovers = HashMap::new();
         let mut changes = Vec::new();
-        for entry in raws {
-            if let Some(new_changes) = entry.changes {
-                changes.extend(new_changes)
-            } else {
-                let text = Arc::new(entry.out);
-                if let Some(frame) = entry.frames.into_iter().find(|frame| frame.file == path) {
-                    let run_entry = new_data.entry(frame).or_insert(RunEntry {
-                        out: Vec::new(),
-                        insert_type: entry.insert.clone(),
-                    });
-                    run_entry.out.push(text.clone())
+        while let Some(entry) = raws.next().await {
+            // for entry in raws {
+            match entry.inner {
+                RawEntryInner::Simple { out, kind } => {
+                    let text = Arc::new(out);
+                    let kind = kind.unwrap_or(RawEntryKind::Output);
+
+                    match kind {
+                        RawEntryKind::Output => {
+                            if let Some(frame) =
+                                entry.frames.into_iter().find(|frame| frame.file == path)
+                            {
+                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
+                                    out: Vec::new(),
+                                    insert_type: None,
+                                });
+                                run_entry.out.push(text.clone())
+                            }
+                        }
+                        RawEntryKind::Debug => {
+                            if let Some(frame) = entry
+                                .frames
+                                .into_iter()
+                                .rev()
+                                .find(|frame| frame.file == path)
+                            {
+                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
+                                    out: Vec::new(),
+                                    insert_type: None,
+                                });
+                                run_entry.out.push(text.clone())
+                            }
+                        }
+                        RawEntryKind::Error => {
+                            for frame in entry.frames.into_iter() {
+                                let run_entry = new_hovers.entry(frame).or_insert(RunEntry {
+                                    out: Vec::new(),
+                                    insert_type: None,
+                                });
+                                run_entry.out.push(text.clone())
+                            }
+                        }
+                        RawEntryKind::Regex => {
+                            if let Some(frame) =
+                                entry.frames.into_iter().find(|frame| frame.file == path)
+                            {
+                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
+                                    out: Vec::new(),
+                                    insert_type: None,
+                                });
+                                run_entry.out.push(text.clone())
+                            }
+                        }
+                    }
                 }
+                RawEntryInner::Edits {
+                    changes: new_changes,
+                } => changes.extend(new_changes),
             }
         }
 
         RunData {
-            entries: new_data,
+            entries: new_entries,
+            hovers: new_hovers,
             changes,
         }
     }
@@ -335,7 +405,8 @@ impl Backend {
 
             // update comments
             if let Some(contents) = contents {
-                self.update_comments(uri, &contents).await
+                self.update_comments(uri, &contents).await;
+                self.update_diagnostics(uri, &contents).await;
             } else {
                 log::warn!("no text in handle_save");
             }
@@ -353,16 +424,23 @@ impl Backend {
             .map(|buffer| ropey::Rope::clone(&*buffer))
             .unwrap_or_default();
 
-        let res = config.runner.run_collect(&path, buffer).await;
-        log::warn!("reload res: {:?}", res);
+        let res = config.runner.run(&path, buffer).await;
         let raw_data = match res {
-            Ok(data) => data,
+            Ok(data) => data.filter_map(|item| async {
+                match item {
+                    Ok(val) => Some(val),
+                    Err(err) => {
+                        log::warn!("could not read reload entry line; skipping: {:?}", err);
+                        None
+                    }
+                }
+            }),
             Err(err) => {
                 log::warn!("could not reload data, {}", err);
                 return;
             }
         };
-        let new_data = RunData::from_raw(raw_data, &path);
+        let new_data = RunData::from_raw(Box::pin(raw_data), &path).await;
         log::info!("new: {:?}", new_data);
         data.data.store(Arc::new(new_data));
     }
@@ -386,6 +464,38 @@ impl Backend {
             .enumerate()
             .filter(move |(_, line)| Self::starts_with(line, output_start))
             .map(|(line, _)| line)
+    }
+
+    async fn update_diagnostics(&self, uri: &Url, contents: &Rope) {
+        let data = self.0.data.load();
+        let diags: Vec<Diagnostic> = data
+            .hovers
+            .iter()
+            .filter(|(frame, _)| frame.file == uri.path())
+            .map(|(frame, entry)| Diagnostic {
+                range: Range::new(
+                    Position::new(frame.line - 1, 0),
+                    Position::new(
+                        frame.line - 1,
+                        contents.line(frame.line as usize - 1).len_chars() as u64,
+                    ),
+                ),
+                severity: None,
+                code: None,
+                source: Some("nwn".to_string()),
+                message: entry.out.iter().map(|s| s.as_str()).collect(),
+                related_information: None,
+                tags: None,
+            })
+            .collect();
+
+        let response = self
+            .0
+            .client
+            .publish_diagnostics(uri.clone(), diags, None)
+            .await;
+
+        log::info!("diag response: {:?}", response);
     }
 
     async fn update_comments(&self, uri: &Url, contents: &Rope) {
@@ -572,6 +682,8 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let t = SystemTime::now();
+        log::info!("change start {:?}", t);
         let buffer: Rope = params.content_changes[0].text.as_str().into();
         self.0
             .buffers
@@ -589,6 +701,7 @@ impl LanguageServer for Backend {
             self.handle_save(&params.text_document.uri, Some(buffer))
                 .await
         }
+        log::info!("change end {:?}", t);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -636,12 +749,12 @@ impl LanguageServer for Backend {
         } else {
             Ok(None)
         }
-}
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    simple_logging::log_to_file("test.log", log::LevelFilter::Info).unwrap();
+    simple_logging::log_to_file("/tmp/test.log", log::LevelFilter::Info).unwrap();
     log_panics::init();
     log::info!("start");
 
