@@ -606,30 +606,7 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
-        log::info!("params {:?}", &params);
-        let path = params
-            .text_document_position_params
-            .text_document
-            .uri
-            .path();
-        log::warn!("path: {:?}", path);
-
-        let frame = Frame {
-            file: path.to_owned(),
-            line: params.text_document_position_params.position.line + 1,
-        };
-
-        Ok(self.0.data.load().entries.get(&frame).map(|data| {
-            let mut msg = String::new();
-            for s in &data.out {
-                msg.push_str(s)
-            }
-            log::info!("hover msg {:?}", msg);
-            Hover {
-                contents: HoverContents::Scalar(MarkedString::String(msg)),
-                range: None,
-            }
-        }))
+        Ok(None)
     }
 
     async fn folding_range(
