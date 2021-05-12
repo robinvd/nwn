@@ -540,6 +540,11 @@ impl Backend {
         ) -> Option<TextEdit> {
             let offset_range =
                 find_prev_output(contents, &config.line_comment, frame.line as usize - 1);
+            let indent: String = contents
+                .line(frame.line as usize - 1)
+                .chars()
+                .take_while(|c| c.is_ascii_whitespace())
+                .collect();
             let range = offset_range
                 .map(|(start_line, end_line)| {
                     Range::new(
@@ -553,7 +558,7 @@ impl Backend {
 
             let single_line = false;
             let text = if single_line {
-                let mut text = format!("{}> ", config.line_comment);
+                let mut text = format!("{}{}> ", indent, config.line_comment);
                 text.extend(entry.out.iter().map(|msg| format!("{:?} | ", msg)));
                 text.push('\n');
                 text
@@ -565,7 +570,12 @@ impl Backend {
                     .flatten()
                     .map(|msg| {
                         let escaped = format!("{:?}", msg);
-                        format!("{}> {}\n", config.line_comment, escaped.trim_matches('"'))
+                        format!(
+                            "{}{}> {}\n",
+                            indent,
+                            config.line_comment,
+                            escaped.trim_matches('"')
+                        )
                     })
                     .collect()
             };
