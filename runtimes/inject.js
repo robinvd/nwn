@@ -12,6 +12,7 @@ function getStackTrace() {
         .map((line) => /\(([^:]+):(\d+):\d+\)/.exec(line))
         .filter((match) => match !== null)
         .map((match) => { return { file: match[1], line: Number(match[2]) } })
+        .reverse()
 
     return stackData;
 }
@@ -30,15 +31,26 @@ function handleMessage(data) {
 
 const client = net.createConnection(connectionPath);
 
-console.log = (...args) => {
-    log("console log started");
+const sendOutput = (kind, out) => {
+    log("send started");
     const stackData = getStackTrace();
     const data = {
         frames: stackData,
-        out: args.join(" "),
+        out: out,
+        kind: kind,
     }
     const output_data = JSON.stringify(data) + '\n';
     client.write(output_data)
+}
+
+
+global.show = (...args) => {
+    const out = args.join(" ")
+    sendOutput("output", out)
+}
+global.debug = (...args) => {
+    const out = args.join(" ")
+    sendOutput("debug", out)
 }
 
 let contents = "";
