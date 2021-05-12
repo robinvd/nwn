@@ -622,20 +622,67 @@ impl Backend {
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             let data = self.0.data.load();
-            let mut changes: Vec<TextEdit> = data
-                .entries
-                .iter()
-                .filter(|(frame, _)| frame.file == uri.path())
-                .filter_map(|(frame, entry)| {
-                    if entry.insert_type.is_some() {
-                        make_insert(contents, &config, frame, &entry)
-                    } else {
-                        make_output_comment(contents, &config, frame, &entry)
-                    }
-                })
-                .collect();
 
-            changes.extend(data.changes.iter().cloned());
+            let changes = {
+                let uri_path = uri.path();
+                let mut entries_vec: Vec<_> = data
+                    .entries
+                    .iter()
+                    .filter(|(frame, _entry)| frame.file == uri_path)
+                    .collect();
+                entries_vec.sort_by_key(|(frame, _)| frame.line);
+
+                let mut entries = entries_vec.into_iter().peekable();
+
+                let mut line_n = 0;
+                let mut changes = Vec::new();
+                while line_n < contents.len_lines() {
+                    log::warn!("{}; loop line:", line_n);
+                    let mut current_line_has_output = false;
+                    while let Some((frame, entry)) = entries.peek() {
+                        let frame_line = frame.line as usize - 1;
+                        if frame_line <= line_n {
+                            log::warn!("{}; appying entry", frame_line);
+                            if let Some(change) =
+                                make_output_comment(contents, &config, frame, entry)
+                            {
+                                changes.push(change)
+                            }
+                            entries.next().unwrap();
+                            current_line_has_output |= frame_line == line_n;
+                            let prev_output =
+                                find_prev_output(contents, &config.line_comment, line_n);
+                            if let Some((start_line, end_line)) = prev_output {
+                                line_n = end_line;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    log::warn!("{}; line has var {}", line_n, current_line_has_output);
+                    if !current_line_has_output {
+                        let prev_output = find_prev_output(contents, &config.line_comment, line_n);
+                        if let Some((start_line, end_line)) = prev_output {
+                            log::warn!("{}; delete", line_n);
+                            changes.push(TextEdit::new(
+                                Range::new(
+                                    Position::new(start_line as u64, 0),
+                                    Position::new(end_line as u64, 0),
+                                ),
+                                String::new(),
+                            ));
+
+                            line_n = end_line;
+                        }
+                    }
+                    line_n += 1;
+                }
+
+                changes.extend(entries.filter_map(|(frame, entry)| {
+                    make_output_comment(contents, &config, frame, entry)
+                }));
+                changes
+            };
 
             log::info!("edits: {:?}", changes);
 
