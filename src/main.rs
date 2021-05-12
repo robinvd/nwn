@@ -23,6 +23,13 @@ use tower_lsp::{
     jsonrpc::Result as RpcResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
 
+fn time() -> usize {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 struct Frame {
     file: String,
@@ -112,7 +119,7 @@ impl Runner {
             .stdout(Stdio::piped())
             .spawn()?;
 
-        log::info!("spawned");
+        log::error!("spawned runtime:{}", time());
 
         let stdout = handle.stdout.take().unwrap();
         let stderr = handle.stderr.take().unwrap();
@@ -138,7 +145,7 @@ impl Runner {
                 .map_err(|err| log::error!("err: {:?}", err))
                 .ok();
 
-            log::info!("child finished")
+            log::error!("runtime finished:{}", time())
         });
 
         let (right, _) = listener.accept().await?;
@@ -154,7 +161,7 @@ impl Runner {
 
             write.write_all(&[0]).await.ok();
 
-            log::info!("finished contents write");
+            log::error!("finished contents write:{}", time());
         });
 
         log::info!("start loop");
@@ -682,8 +689,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let t = SystemTime::now();
-        log::info!("change start {:?}", t);
+        log::error!("change start:{}", time());
         let buffer: Rope = params.content_changes[0].text.as_str().into();
         self.0
             .buffers
@@ -701,7 +707,7 @@ impl LanguageServer for Backend {
             self.handle_save(&params.text_document.uri, Some(buffer))
                 .await
         }
-        log::info!("change end {:?}", t);
+        log::error!("change end:{}", time());
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
