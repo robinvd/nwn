@@ -1,5 +1,4 @@
 const net = require('net')
-const log = console.log;
 
 const connectionPath = process.env.NWN_CONNECTION_FD;
 const realFile = process.env.NWN_FILE_PATH
@@ -25,14 +24,14 @@ function requireFromString(src, filename) {
 }
 
 function handleMessage(data) {
-    log('handle msg');
+    console.log('handle msg');
     requireFromString(data, realFile)
 }
 
 const client = net.createConnection(connectionPath);
 
 const sendOutput = (kind, out) => {
-    log("send started");
+    console.log("send started");
     const stackData = getStackTrace();
     const data = {
         frames: stackData,
@@ -66,5 +65,5 @@ client.on('data', (data) => {
 })
 
 client.on('end', () => {
-    log("end!")
+    console.log("end!")
 })
