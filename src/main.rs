@@ -11,7 +11,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::{future, Stream, StreamExt, TryStreamExt};
+use futures::{future, lock::Mutex, Stream, StreamExt, TryStreamExt};
 use regex::Regex;
 use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
@@ -347,13 +347,32 @@ impl Config {
     }
 }
 
+#[derive(Debug, Default)]
+struct BufferData {
+    /// The actual text in the buffer
+    buffer: ropey::Rope,
+    /// A lock for when we are using the buffer, so that updates happen serially
+    locked: Arc<Mutex<()>>,
+}
+
+impl BufferData {
+    fn new(buffer: ropey::Rope) -> Self {
+        Self {
+            buffer,
+            locked: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+/// All the data the backend has
 #[derive(Debug)]
 struct BackendData {
+    /// The client for communicating with the editor
     client: Client,
     data: ArcSwap<RunData>,
     runner: Option<Runner>,
     config: ArcSwap<Config>,
-    buffers: DashMap<Url, ropey::Rope>,
+    buffers: DashMap<Url, BufferData>,
 }
 
 impl Backend {
@@ -404,19 +423,15 @@ impl Backend {
         config
     }
 
-    pub async fn handle_save(&self, uri: &Url, contents: Option<Rope>) {
+    pub async fn handle_save(&self, uri: &Url, contents: Rope) {
         log::info!("handle save");
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             self.reload_data(config, uri).await;
 
             // update comments
-            if let Some(contents) = contents {
-                self.update_comments(uri, &contents).await;
-                self.update_diagnostics(uri, &contents).await;
-            } else {
-                log::warn!("no text in handle_save");
-            }
+            self.update_comments(uri, &contents).await;
+            self.update_diagnostics(uri, &contents).await;
         }
     }
 
@@ -428,7 +443,7 @@ impl Backend {
             .0
             .buffers
             .get(uri)
-            .map(|buffer| ropey::Rope::clone(&*buffer))
+            .map(|buffer| ropey::Rope::clone(&buffer.buffer))
             .unwrap_or_default();
 
         let res = config.runner.run(&path, buffer).await;
@@ -733,12 +748,19 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let buffer: Rope = params.text_document.text.as_str().into();
-        self.0
-            .buffers
-            .insert(params.text_document.uri.clone(), buffer.clone());
 
-        self.handle_save(&params.text_document.uri, Some(buffer))
-            .await
+        let lock = {
+            let mut entry = self
+                .0
+                .buffers
+                .entry(params.text_document.uri.clone())
+                .or_default();
+            entry.buffer = buffer.clone();
+            entry.locked.clone()
+        };
+        lock.lock().await;
+
+        self.handle_save(&params.text_document.uri, buffer).await
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -748,33 +770,30 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         log::error!("change start:{}", time());
         let buffer: Rope = params.content_changes[0].text.as_str().into();
-        self.0
-            .buffers
-            .insert(params.text_document.uri.clone(), buffer.clone());
+        let lock = {
+            let mut entry = self
+                .0
+                .buffers
+                .entry(params.text_document.uri.clone())
+                .or_default();
+            entry.buffer = buffer.clone();
+            entry.locked.clone()
+        };
+        lock.lock().await;
+
         log::info!(
             "new buffer: {:?}",
             self.0
                 .buffers
                 .get(&params.text_document.uri)
-                .map(|rope| rope.len_bytes())
+                .map(|buffer| buffer.buffer.len_bytes())
         );
 
         let config = self.language_config_for_uri(&params.text_document.uri);
         if config.map(|config| config.on_change).unwrap_or_default() {
-            self.handle_save(&params.text_document.uri, Some(buffer))
-                .await
+            self.handle_save(&params.text_document.uri, buffer).await
         }
         log::error!("change end:{}", time());
-    }
-
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let buffer = self
-            .0
-            .buffers
-            .get(&params.text_document.uri)
-            .as_deref()
-            .cloned();
-        self.handle_save(&params.text_document.uri, buffer).await
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
@@ -792,7 +811,7 @@ impl LanguageServer for Backend {
         if let Some(buffer) = self.0.buffers.get(&params.text_document.uri) {
             let mut folds: Vec<FoldingRange> = Vec::new();
             for line_number in self
-                .find_output_ranges(&params.text_document.uri, &buffer)
+                .find_output_ranges(&params.text_document.uri, &buffer.buffer)
                 .map(|n| n as u64)
             {
                 match folds.last_mut() {
