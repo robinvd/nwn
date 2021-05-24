@@ -2,283 +2,39 @@ use std::{
     collections::HashMap,
     error::Error,
     fs::File,
-    io::{self, Read},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::{future, lock::Mutex, Stream, StreamExt, TryStreamExt};
+use futures::{lock::Mutex, StreamExt};
 use regex::Regex;
 use ropey::{Rope, RopeSlice};
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt},
-    net::UnixListener,
-};
+use runner::RunData;
+use serde::Deserialize;
 use tower_lsp::{
     jsonrpc::Result as RpcResult, lsp_types::*, Client, LanguageServer, LspService, Server,
 };
+use util::rope_starts_with;
 
-fn time() -> usize {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as usize
-}
+use crate::{protocol::Frame, runner::RunEntry};
+use crate::{runner::Runner, util::time};
 
-#[derive(Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
-struct Frame {
-    file: String,
-    line: u64,
-}
+mod protocol;
+mod runner;
+mod util;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct RawEntry {
-    frames: Vec<Frame>,
-    #[serde(flatten)]
-    inner: RawEntryInner,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum RawEntryInner {
-    Simple {
-        out: String,
-        // insert: Option<String>,
-        kind: Option<RawEntryKind>,
-    },
-    Edits {
-        changes: Vec<TextEdit>,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum RawEntryKind {
-    Output,
-    Debug,
-    Error,
-    Regex,
-}
-
-impl RawEntry {
-    fn from_json(reader: impl Read) -> Result<Self, Box<dyn std::error::Error>> {
-        let entry = serde_json::de::from_reader(reader);
-        match entry {
-            Ok(entry) => Ok(entry),
-            Err(err) => {
-                log::error!("loading err {:?}", err);
-                Err(Box::new(err))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct Runner {
-    command: String,
-    args: Vec<String>,
-}
-
-impl Runner {
-    async fn run_collect(&self, path: &str, input: ropey::Rope) -> io::Result<Vec<RawEntry>> {
-        self.run(path, input).await?.try_collect().await
-    }
-
-    async fn run(
-        &self,
-        path: &str,
-        input: ropey::Rope,
-    ) -> io::Result<impl Stream<Item = io::Result<RawEntry>>> {
-        log::info!("run2");
-
-        let mut dir = std::env::temp_dir();
-        dir.push(&format!(
-            "nwn_conn{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-
-        log::info!("path {:?}", dir);
-        let mut listener = UnixListener::bind(&dir)?;
-
-        log::info!("opened");
-        let mut command = tokio::process::Command::new(&self.command);
-        let mut handle = command
-            .env("NWN_FILE_PATH", path)
-            .env("NWN_CONNECTION_FD", &dir)
-            .args(&self.args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-
-        log::error!("spawned runtime:{}", time());
-
-        let stdout = handle.stdout.take().unwrap();
-        let stderr = handle.stderr.take().unwrap();
-
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr).lines();
-
-            while let Some(line) = reader.next().await {
-                log::error!("inject msg: {:?}", line);
-            }
-        });
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stdout).lines();
-
-            while let Some(line) = reader.next().await {
-                log::warn!("inject msg: {:?}", line);
-            }
-        });
-
-        tokio::spawn(async move {
-            handle
-                .await
-                .map_err(|err| log::error!("err: {:?}", err))
-                .ok();
-
-            log::error!("runtime finished:{}", time())
-        });
-
-        let (right, _) = listener.accept().await?;
-        let (read, mut write) = tokio::io::split(right);
-
-        tokio::spawn(async move {
-            for part in input.chunks() {
-                let result = write.write_all(part.as_bytes()).await;
-                if result.is_err() {
-                    break;
-                }
-            }
-
-            write.write_all(&[0]).await.ok();
-
-            log::error!("finished contents write:{}", time());
-        });
-
-        log::info!("start loop");
-
-        Ok(tokio::io::BufReader::new(read)
-            .lines()
-            .inspect(|line| log::info!("line: {:?}", line))
-            .try_filter(|line| future::ready(!line.trim().is_empty()))
-            .try_filter_map(|line| async move {
-                log::info!("got line: {:?}", line);
-                let entry = RawEntry::from_json(line.as_bytes());
-                match entry {
-                    Ok(entry) => Ok(Some(entry)),
-                    Err(err) => {
-                        log::error!("reading line json err: {:?}", err);
-                        Ok(None)
-                    }
-                }
-            }))
-    }
-}
-
-#[derive(Debug, Default)]
-struct RunData {
-    entries: HashMap<Frame, RunEntry>,
-    hovers: HashMap<Frame, RunEntry>,
-    changes: Vec<TextEdit>,
-}
-
-#[derive(Debug)]
-struct RunEntry {
-    insert_type: Option<String>,
-    out: Vec<Arc<String>>,
-}
-
-impl RunData {
-    pub async fn from_raw(mut raws: impl Stream<Item = RawEntry> + Unpin, path: &str) -> Self {
-        let mut new_entries = HashMap::new();
-        let mut new_hovers = HashMap::new();
-        let mut changes = Vec::new();
-        while let Some(entry) = raws.next().await {
-            // for entry in raws {
-            match entry.inner {
-                RawEntryInner::Simple { out, kind } => {
-                    let text = Arc::new(out);
-                    let kind = kind.unwrap_or(RawEntryKind::Output);
-
-                    match kind {
-                        RawEntryKind::Output => {
-                            if let Some(frame) =
-                                entry.frames.into_iter().find(|frame| frame.file == path)
-                            {
-                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
-                                    out: Vec::new(),
-                                    insert_type: None,
-                                });
-                                run_entry.out.push(text.clone())
-                            }
-                        }
-                        RawEntryKind::Debug => {
-                            if let Some(frame) = entry
-                                .frames
-                                .into_iter()
-                                .rev()
-                                .find(|frame| frame.file == path)
-                            {
-                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
-                                    out: Vec::new(),
-                                    insert_type: None,
-                                });
-                                run_entry.out.push(text.clone())
-                            }
-                        }
-                        RawEntryKind::Error => {
-                            for frame in entry.frames.into_iter() {
-                                let run_entry = new_hovers.entry(frame).or_insert(RunEntry {
-                                    out: Vec::new(),
-                                    insert_type: None,
-                                });
-                                run_entry.out.push(text.clone())
-                            }
-                        }
-                        RawEntryKind::Regex => {
-                            if let Some(frame) =
-                                entry.frames.into_iter().find(|frame| frame.file == path)
-                            {
-                                let run_entry = new_entries.entry(frame).or_insert(RunEntry {
-                                    out: Vec::new(),
-                                    insert_type: None,
-                                });
-                                run_entry.out.push(text.clone())
-                            }
-                        }
-                    }
-                }
-                RawEntryInner::Edits {
-                    changes: new_changes,
-                } => changes.extend(new_changes),
-            }
-        }
-
-        RunData {
-            entries: new_entries,
-            hovers: new_hovers,
-            changes,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Backend(Arc<BackendData>);
-
+/// Config for a single programming language
 #[derive(Debug, Deserialize)]
 struct LanguageConfig {
+    /// The file extension this language uses (ex .rs)
     extension: String,
+    /// The details for how to run this language.
     runner: Runner,
+    /// The prefix this language uses for line comments (ex "//")
     line_comment: String,
+    /// If this language should be run on each change in the buffer, or only on save. TODO
     #[serde(default)]
     on_change: bool,
 
@@ -294,6 +50,7 @@ struct Place {
     insert_place: usize,
 }
 
+/// Config for this app
 #[derive(Debug, Default, Deserialize)]
 #[serde(transparent)]
 struct Config {
@@ -355,32 +112,40 @@ struct BufferData {
     locked: Arc<Mutex<()>>,
 }
 
-impl BufferData {
-    fn new(buffer: ropey::Rope) -> Self {
-        Self {
-            buffer,
-            locked: Arc::new(Mutex::new(())),
-        }
-    }
-}
-
 /// All the data the backend has
+///
+/// All of this data can only be accessed behind a read only reference
+/// (&BackendData) thus all fields that have to be mutated after the initial
+/// setup need to have interior mutability.
 #[derive(Debug)]
 struct BackendData {
     /// The client for communicating with the editor
     client: Client,
     data: ArcSwap<RunData>,
-    runner: Option<Runner>,
+    /// The config
     config: ArcSwap<Config>,
+    /// A buffer for each file
+    ///
+    /// The editor can send the whole content on each request
+    /// but also only the diff, for this reason we save the bufferdata
+    ///
+    /// Lsp uses an url for identifying a buffer, so that is what we use as
+    /// index.
     buffers: DashMap<Url, BufferData>,
 }
+
+/// The actual backend implementation
+///
+/// We wrap BackendData in an Arc (reference counted pointer), so that we can
+/// share this around without worrying about lifetimes
+#[derive(Debug)]
+struct Backend(Arc<BackendData>);
 
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self(Arc::new(BackendData {
             client,
             data: ArcSwap::default(),
-            runner: None,
             config: ArcSwap::new(Arc::new(Config::default())),
             buffers: DashMap::new(),
         }))
@@ -408,6 +173,7 @@ impl Backend {
         self.0.config.store(Arc::new(config));
     }
 
+    /// Get the LanguageConfig for this path
     pub fn language_config_for_uri(&self, uri: &Url) -> Option<Arc<LanguageConfig>> {
         let path = Path::new(uri.path());
         let config = path
@@ -435,6 +201,7 @@ impl Backend {
         }
     }
 
+    /// Reload the rundata for this language and path
     pub async fn reload_data(&self, config: Arc<LanguageConfig>, uri: &Url) {
         log::info!("start reload");
         let data = self.0.clone();
@@ -467,27 +234,20 @@ impl Backend {
         data.data.store(Arc::new(new_data));
     }
 
-    fn starts_with(slice: &RopeSlice, text: &str) -> bool {
-        if slice.len_chars() < text.chars().count() {
-            return false;
-        }
-        slice.chars().zip(text.chars()).all(|(x, y)| x == y)
-    }
-
-    fn find_output_ranges<'a>(
-        &self,
-        uri: &Url,
-        contents: &'a Rope,
-    ) -> impl Iterator<Item = usize> + 'a {
+    /// Find all line indices that have NwoN output
+    ///
+    /// NwoN output is indicated by a linecomment postfixed by a '>' character.
+    fn find_output_ranges<'a>(&self, contents: &'a Rope) -> impl Iterator<Item = usize> + 'a {
         // TODO language idenpendant
         let output_start = "#>";
         contents
             .lines()
             .enumerate()
-            .filter(move |(_, line)| Self::starts_with(line, output_start))
+            .filter(move |(_, line)| rope_starts_with(line, output_start))
             .map(|(line, _)| line)
     }
 
+    /// Send the diagnostics to the editor
     async fn update_diagnostics(&self, uri: &Url, contents: &Rope) {
         let data = self.0.data.load();
         let diags: Vec<Diagnostic> = data
@@ -520,6 +280,7 @@ impl Backend {
         log::info!("diag response: {:?}", response);
     }
 
+    /// Given the current buffer and the runtime output, compute the changes required and send those to the editor.
     async fn update_comments(&self, uri: &Url, contents: &Rope) {
         /// find lines with comment output, result is an exclusive range
         fn find_prev_output(
@@ -607,33 +368,6 @@ impl Backend {
             Some(TextEdit::new(range, text))
         }
 
-        fn make_insert(
-            contents: &Rope,
-            config: &LanguageConfig,
-            frame: &Frame,
-            entry: &RunEntry,
-        ) -> Option<TextEdit> {
-            let insert_type = entry.insert_type.as_ref().unwrap();
-            let line_text = contents.line(frame.line as usize - 1).to_string();
-
-            config
-                .places
-                .iter()
-                .filter(|place| &place.name == insert_type)
-                .filter_map(|place| {
-                    log::info!("trying: {:?}", place.regex);
-                    let captures = place.regex.captures(&line_text)?;
-                    let match_ = captures.get(place.insert_place)?;
-                    log::info!("regex match: {:?}", match_);
-                    let range = Range::new(
-                        Position::new(frame.line - 1, match_.start() as u64),
-                        Position::new(frame.line - 1, match_.end() as u64),
-                    );
-                    Some(TextEdit::new(range, entry.out.first()?.to_string()))
-                })
-                .next()
-        }
-
         let config = self.language_config_for_uri(uri);
         if let Some(config) = config {
             let data = self.0.data.load();
@@ -667,7 +401,7 @@ impl Backend {
                             current_line_has_output |= frame_line == line_n;
                             let prev_output =
                                 find_prev_output(contents, &config.line_comment, line_n);
-                            if let Some((start_line, end_line)) = prev_output {
+                            if let Some((_start_line, end_line)) = prev_output {
                                 line_n = end_line;
                             }
                         } else {
@@ -810,10 +544,7 @@ impl LanguageServer for Backend {
     ) -> RpcResult<Option<Vec<FoldingRange>>> {
         if let Some(buffer) = self.0.buffers.get(&params.text_document.uri) {
             let mut folds: Vec<FoldingRange> = Vec::new();
-            for line_number in self
-                .find_output_ranges(&params.text_document.uri, &buffer.buffer)
-                .map(|n| n as u64)
-            {
+            for line_number in self.find_output_ranges(&buffer.buffer).map(|n| n as u64) {
                 match folds.last_mut() {
                     Some(last) if last.end_line + 1 == line_number => {
                         last.end_line += 1;
